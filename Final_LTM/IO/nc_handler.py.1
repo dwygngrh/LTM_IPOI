@@ -1,0 +1,89 @@
+import os
+import numpy as np
+from netCDF4 import Dataset, date2num
+
+class DataProvider:
+    def __init__(self, cmems_dir, era5_dir):
+        self.cmems_dir = cmems_dir
+        self.era5_dir = era5_dir
+        
+        # 1. Load Current (CMEMS) Grid Coordinates
+        cmems_files = sorted([f for f in os.listdir(cmems_dir) if f.endswith('.nc')])
+        sample_cmems = os.path.join(cmems_dir, cmems_files[0])
+        
+        with Dataset(sample_cmems, 'r') as ds:
+            # Convert grids to standard numpy arrays to satisfy Numba
+            self.lon_c = np.asarray(ds.variables['longitude'][:], dtype=np.float64)
+            self.lat_c = np.asarray(ds.variables['latitude'][:], dtype=np.float64)
+            self.cmems_time_units = ds.variables['time'].units
+            self.cmems_calendar = ds.variables['time'].calendar
+
+        # 2. Load Bathymetry data verbatim[cite: 1, 2]
+        # path is the same as CMEMS directory
+        bathy_path = os.path.join(cmems_dir, "bathy_meter.nc")
+        if not os.path.exists(bathy_path):
+            raise FileNotFoundError(f"Missing verbatim bathymetry file: {bathy_path}[cite: 1]")
+            
+        with Dataset(bathy_path, 'r') as ds_b:
+            # Load bathymetry grid and depth values
+            self.lon_b = np.asarray(ds_b.variables['longitude'][:], dtype=np.float64)
+            self.lat_b = np.asarray(ds_b.variables['latitude'][:], dtype=np.float64)
+            # Use 'depth' variable for bathymetry calculation[cite: 2]
+            self.bathy_depth = np.asarray(ds_b.variables['deptho'][:], dtype=np.float64)
+
+        # 3. Load Wind (ERA5) Grid Coordinates
+        era5_files = sorted([f for f in os.listdir(era5_dir) if f.endswith('.nc')])
+        if not era5_files:
+            self.lon_w = self.lon_c
+            self.lat_w = self.lat_c
+        else:
+            sample_era5 = os.path.join(era5_dir, era5_files[0])
+            with Dataset(sample_era5, 'r') as ds:
+                self.lon_w = np.asarray(ds.variables['longitude'][:], dtype=np.float64)
+                self.lat_w = np.asarray(ds.variables['latitude'][:], dtype=np.float64)
+                self.era5_time_units = ds.variables['valid_time'].units
+                self.era5_calendar = ds.variables['valid_time'].calendar
+
+    def get_step_data(self, timestamp, mode='microplastic'):
+        """Retrieves data and ensures standard NumPy arrays are returned."""
+        cmems_file_name = f"GLORYS_Y{timestamp.year}M{timestamp.month:02d}.nc"
+        cmems_path = os.path.join(self.cmems_dir, cmems_file_name)
+        
+        if not os.path.exists(cmems_path):
+            raise FileNotFoundError(f"Missing CMEMS file: {cmems_path}")
+
+        with Dataset(cmems_path, 'r') as ds:
+            # Correct attribute from user history: set_auto_maskandscale
+            ds.set_auto_maskandscale(True)
+            target_time = date2num(timestamp, units=self.cmems_time_units, 
+                                   calendar=self.cmems_calendar)
+            time_values = ds.variables['time'][:]
+            time_idx = np.argmin(np.abs(time_values - target_time))
+            
+            u_raw = ds.variables['uo'][time_idx, 0, :, :]
+            v_raw = ds.variables['vo'][time_idx, 0, :, :]
+            
+            u = np.asarray(u_raw.filled(np.nan), dtype=np.float64)
+            v = np.asarray(v_raw.filled(np.nan), dtype=np.float64)
+
+        era5_file_name = f"ERA5_Y{timestamp.year}M{timestamp.month:02d}.nc"
+        era5_path = os.path.join(self.era5_dir, era5_file_name)
+        
+        if os.path.exists(era5_path):
+            with Dataset(era5_path, 'r') as ds_w:
+                ds_w.set_auto_maskandscale(True)
+                target_time_w = date2num(timestamp, units=self.era5_time_units, 
+                                         calendar=self.era5_calendar)
+                time_values_w = ds_w.variables['time'][:]
+                time_idx_w = np.argmin(np.abs(time_values_w - target_time_w))
+                
+                uw_raw = ds_w.variables['u10'][time_idx_w, :, :]
+                vw_raw = ds_w.variables['v10'][time_idx_w, :, :]
+                
+                uw = np.asarray(uw_raw.filled(np.nan), dtype=np.float64)
+                vw = np.asarray(vw_raw.filled(np.nan), dtype=np.float64)
+        else:
+            uw = np.zeros_like(u, dtype=np.float64)
+            vw = np.zeros_like(v, dtype=np.float64)
+
+        return u, v, uw, vw
